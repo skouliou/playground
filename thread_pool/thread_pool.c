@@ -7,11 +7,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "log.h"
 
+// TODO: thread safe logging
 // TODO: implement an object pool?
 #define xmalloc malloc
 #define xfree free
+
+#ifdef _THP_LOGGING
+#include <errno.h>
+#include <string.h>
+
+#include "log.h"
+
+# define thp_log_info(...) log_info(__VA_ARGS__)
+# define thp_log_debug(...) log_debug(__VA_ARGS__)
+# define thp_log_error(...) log_error(__VA_ARGS__)
+#else
+# define thp_log_info(...)
+# define thp_log_debug(...)
+# define thp_log_error(...)
+#endif // _THC_LOGGING
 
 ///////////////////////////////////////////////////////////////////////
 /// Typedefs
@@ -39,11 +54,14 @@ struct thp_futur_s {
 /// allocate a new empty future
 static thp_future_t *thp_future_new() {
   thp_future_t *future = xmalloc(sizeof(thp_future_t));
-  if (future == NULL)
+  if (future == NULL) {
+    thp_log_error("could not create future (err: %s)", strerror(errno));
     return NULL;
+  }
 
   // initialization
   if (sem_init(&future->ready, 0, 0) == -1) {
+    thp_log_error("could not create future (err: %s)", strerror(errno));
     xfree(future);
     return NULL;
   }
@@ -56,13 +74,13 @@ static void *thp_future_consume(thp_future_t *future) {
   assert(future);
   void *result = NULL;
   // wait for the task related to this future to complete
-  log_debug("future (%p) waiting...", future);
+  thp_log_debug("future (%p) waiting...", future);
   sem_wait(&future->ready);
   // extract the result from teh future
   result = future->value;
   sem_destroy(&future->ready);
   xfree(future);
-  log_info("future (%p) ready", future);
+  thp_log_info("future (%p) ready", future);
   return result;
 }
 
@@ -93,7 +111,7 @@ static thp_task_t *thp_task_new(thp_task_func work, void *args,
 
   thp_task_t *task = xmalloc(sizeof(thp_task_t));
   if (task == NULL) {
-    log_error("could not create task");
+    thp_log_error("could not create task (err: %s)", strerror(errno));
     return NULL;
   }
 
@@ -171,13 +189,14 @@ static inline int thp_init_queue(struct thp_queue_s *queue, size_t size,
 
   r = pthread_cond_init(&queue->nonempty, NULL);
   if (r == -1) {
-    log_error("unable to initialize conditional variable");
+    thp_log_error("unable to initialize conditional variable (err: %s)",
+              strerror(errno));
     goto on_cond_error;
   }
 
   r = pthread_mutex_init(&queue->lock, NULL);
   if (r == -1) {
-    log_error("unable to initialize mutex");
+    thp_log_error("unable to initialize mutex (err: %s)", strerror(errno));
     goto on_mutex_error;
   }
 
@@ -257,6 +276,7 @@ struct thp_attr_s {
   // INFO:  queue type? (heap, circular, linear, fixed, dynamic)
 };
 
+/// default attribute for thread pool creation
 static const thp_attr_t THP_DEFAULT_ATTR = {
     .pool_size = THP_DEFAULT_POOL_SIZE,
     .queue_size_hint = THP_DEFAULT_QUEUE_SIZE,
@@ -278,7 +298,7 @@ struct thp_s {
   // thread pool
   pthread_t *pool;
   // stop flag
-  int halt; // XXX: use atomics?
+  _Atomic(int) halt;
 };
 
 enum thp_task_status_t {
@@ -288,7 +308,7 @@ enum thp_task_status_t {
 };
 
 static void *thp_worker_loop(void *thp) {
-  log_info("thread (%lu) running fetch execute cycle...", pthread_self());
+  thp_log_info("thread (%lu) running fetch execute cycle...", pthread_self());
   thp_t *owner = thp;
 
   thp_sched_t *sched = &owner->scheduler;
@@ -296,25 +316,27 @@ static void *thp_worker_loop(void *thp) {
   void *result = NULL;
   enum thp_task_status_t status;
 
+  // INFO: unlock queue mutex before exiting to avoid deadlock
+  pthread_cleanup_push(_thp_worker_thread_cleanup, &sched->queue->lock);
   // should stop?
   while (owner->halt != 1) {
     // fetch next task
     task = sched->next_task(sched->queue);
     // run task
-    log_debug("thread(%lu) running task (%p)", pthread_self(), task);
+    thp_log_debug("thread(%lu) running task (%p)", pthread_self(), task);
     status = task->run(task->args, &result);
 
     switch (status) {
     case THP_TASK_FINISHED:
       // mark task as completed and notify the related the future
       thp_task_completed(task, result);
-      log_debug("task (%p) completed", task);
+      thp_log_debug("task (%p) completed", task);
       break;
 
     case THP_TASK_PENDING:
       // requeue task to be run again
       owner->scheduler.add_task(task, &owner->queue);
-      log_debug("task (%p) requeued", task);
+      thp_log_debug("task (%p) requeued", task);
       break;
     }
   } // repeat cycle
@@ -332,15 +354,15 @@ static inline int thp_init_pool(thp_t *thp, const pthread_attr_t *attr) {
     r = pthread_create(&thp->pool[init], attr, thp_worker_loop, thp);
     // not enough resources? possible `EAGAIN`
     if (r == -1) {
-      log_error("thread creation failed");
+      thp_log_error("thread creation failed (err: %s)", strerror(errno));
       break;
     }
-    log_debug("thread (%zu) created (id: %lu)", init, thp->pool[init]);
+    thp_log_debug("thread (%zu) created (id: %lu)", init, thp->pool[init]);
   }
 
   // cancel initialized threads in case of error
   if (r == -1) {
-    log_error("cancelling other threads");
+    thp_log_error("cancelling other threads");
     for (int j = 0; j < init; ++j) {
       // FIXME: change thread cancellation attribute
       pthread_cancel(thp->pool[j]);
@@ -372,7 +394,7 @@ thp_t *thp_create(thp_attr_t *attr) {
       .size = attr->pool_size,
   };
 
-  log_info("initializing scheduler...");
+  thp_log_info("initializing scheduler...");
   thp->scheduler = (thp_sched_t){
       .queue = &thp->queue,
       .init_queue_backend = attr->scheduler.init_queue_backend,
@@ -381,11 +403,11 @@ thp_t *thp_create(thp_attr_t *attr) {
   };
 
   int r;
-  log_info("initializing task queue...");
+  thp_log_info("initializing task queue...");
   r = thp_init_queue(&thp->queue, thp->size, thp->scheduler.init_queue_backend);
   assert(r != -1);
 
-  log_info("initializing worker threads...");
+  thp_log_info("initializing worker threads...");
   r = thp_init_pool(thp, attr->worker_attr);
   assert(r != -1);
 
@@ -400,13 +422,13 @@ thp_future_t *thp_queue_task(thp_t *thp, thp_task_func work, void *args,
                              thp_task_cleanup_func cleanup) {
   assert(thp && work);
 
-  log_info("queuing task...");
+  thp_log_info("queuing task...");
   thp_future_t *future = thp_future_new();
-  log_debug("future (%p) created", future);
+  thp_log_debug("future (%p) created", future);
   assert(future);
 
   thp_task_t *task = thp_task_new(work, args, cleanup, future);
-  log_debug("task (%p) created", task);
+  thp_log_debug("task (%p) created", task);
   assert(task);
 
   thp->scheduler.add_task(task, &thp->queue);
@@ -426,15 +448,19 @@ void *thp_wait(thp_future_t *future) {
 // FIXME: implement this correctly
 void thp_destroy(thp_t *thp) {
   assert(thp);
-  log_info("cancelling and joining worker threads..");
+  thp_log_info("terminating thread pool (%p)", thp);
   thp->halt = 1;
+  thp_log_info("cancelling worker threads");
   for (int i = 0; i < thp->size; ++i) {
     // pthread_sigqueue(thp->pool[i], SIGABRT, (union sigval){.sival_ptr = NULL});
     pthread_cancel(thp->pool[i]);
+    thp_log_debug("worker thread (%p) cancelled", thp->pool[i]);
   }
 
+  thp_log_info("joining worker threads");
   for (int i = 0; i < thp->size; ++i) {
     pthread_join(thp->pool[i], NULL);
+    thp_log_debug("worker thread (%p) joined", thp->pool[i]);
   }
 }
 
