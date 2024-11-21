@@ -307,6 +307,13 @@ enum thp_task_status_t {
   THP_TASK_PENDING,
 };
 
+static inline void _thp_worker_thread_cleanup(void *queue_lock) {
+  thp_log_debug("thread worker (%p) cleanup", pthread_self());
+  if (pthread_mutex_unlock(queue_lock) == -1) {
+    thp_log_error("unable to unlock queue mutex");
+  }
+}
+
 static void *thp_worker_loop(void *thp) {
   thp_log_info("thread (%lu) running fetch execute cycle...", pthread_self());
   thp_t *owner = thp;
@@ -340,6 +347,9 @@ static void *thp_worker_loop(void *thp) {
       break;
     }
   } // repeat cycle
+
+  // INFO: mutex should be unlocked by now
+  pthread_cleanup_pop(0);
 
   return NULL;
 }
@@ -443,7 +453,6 @@ void *thp_wait(thp_future_t *future) {
   return thp_future_consume(future);
 }
 
-#include <signal.h>
 
 // FIXME: implement this correctly
 void thp_destroy(thp_t *thp) {
@@ -452,7 +461,8 @@ void thp_destroy(thp_t *thp) {
   thp->halt = 1;
   thp_log_info("cancelling worker threads");
   for (int i = 0; i < thp->size; ++i) {
-    // pthread_sigqueue(thp->pool[i], SIGABRT, (union sigval){.sival_ptr = NULL});
+    // pthread_sigqueue(thp->pool[i], SIGABRT, (union sigval){.sival_ptr =
+    // NULL});
     pthread_cancel(thp->pool[i]);
     thp_log_debug("worker thread (%p) cancelled", thp->pool[i]);
   }
@@ -478,7 +488,7 @@ enum thp_task_status_t work(void *arg, void **res) {
 
 enum thp_task_status_t wait(void *arg, void **res) {
   sleep(5);
-  printf("hello from wait! (%d)", *(int *)arg);
+  printf("hello from wait! (%d)\n", *(int *)arg);
   *res = arg;
   return THP_TASK_FINISHED;
 }
@@ -493,7 +503,7 @@ int main(void) {
   }
 
   int r = *(int *)thp_wait(f);
-  printf("returned from wait (%d)", r);
+  printf("returned from wait (%d)\n", r);
 
   thp_destroy(thp);
   return 0;
